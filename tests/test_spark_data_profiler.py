@@ -28,13 +28,21 @@ def spark():
 
 def test_bronze_inference_and_quality_metrics(spark):
     rows = [
-        ("001", "10.50", "2026-08-25", "yes", " A "),
-        ("002", "20.00", "2026-08-26", "no", "A"),
-        ("003", "bad", None, "yes", "B"),
-        (None, "", "NULL", None, "B"),
+        ("001", "10.50", "2026-08-25", "yes", " A ", "0.04"),
+        ("002", "20.00", "2026-08-26", "no", "A", "4.0"),
+        ("003", "bad", None, "yes", "B", "0.05"),
+        (None, "", "NULL", None, "B", None),
     ]
     frame = spark.createDataFrame(
-        rows, ["order_id", "amount", "event_date", "active", "category"]
+        rows,
+        [
+            "order_id",
+            "amount",
+            "event_date",
+            "active",
+            "category",
+            "conversion_rate",
+        ],
     )
 
     result = profile_dataframe(
@@ -69,8 +77,20 @@ def test_bronze_inference_and_quality_metrics(spark):
     assert profile["amount"]["unique_values"] == ["10.50", "20.00", "bad"]
     assert profile["amount"]["unique_values_complete"] is True
 
-    assert "TRY_CAST" in result.silver_expressions["amount"]
-    assert "TRY_TO_TIMESTAMP" in result.silver_expressions["event_date"]
+    percentage = profile["conversion_rate"]
+    assert percentage["observed_decimal_scales"] == [1, 2]
+    assert percentage["min_observed_decimal_scale"] == 1
+    assert percentage["max_observed_decimal_scale"] == 2
+    assert percentage["max_observed_decimal_precision"] == 2
+    assert percentage["fractional_percentage_scale_count"] == 2
+    assert percentage["whole_percentage_scale_count"] == 1
+    assert percentage["potential_percentage_type"] is True
+    assert percentage["mixed_percentage_scale_candidate"] is True
+    assert percentage["percentage_scale_risk"] == "high"
+    assert "high_risk_mixed_percentage_scales" in percentage["quality_flags"]
+
+    assert "silver_expression" not in result.profile_df.columns
+    assert "quarantine_predicate" not in result.profile_df.columns
     assert result.suggested_schema["order_id"].dataType.simpleString() == "string"
 
 

@@ -1,9 +1,8 @@
 """Scalable, bronze-to-silver profiling for PySpark DataFrames.
 
 The public entry point is :func:`profile_dataframe`.  It returns a
-``ProfileResult`` containing a Spark DataFrame with one row per input column,
-a suggested ``StructType``, and SQL expressions that can be used in a silver
-select.
+``ProfileResult`` containing a Spark DataFrame with one row per input column
+and a suggested ``StructType``.
 
 The profiler never collects source rows to the driver.  It only collects
 aggregate results, the configured number of top values, and a small sample of
@@ -92,6 +91,12 @@ _IDENTIFIER_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PERCENTAGE_NAME_RE = re.compile(
+    r"(?:^|_)(?:pct|percent|percentage|rate|ratio|share|margin|yield|"
+    r"utilization|utilisation|conversion_rate|discount_rate)(?:$|_)",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ProfilerConfig:
@@ -123,8 +128,8 @@ class ProfilerConfig:
     high_missing_rate: float = 0.20
     categorical_max_distinct: int = 50
     preserve_identifier_strings: bool = True
+    percentage_detection_min_numeric_rate: float = 0.80
     cache_input: bool = True
-    safe_cast_sql_function: str = "TRY_CAST"
 
     def __post_init__(self) -> None:
         if not 0.0 < self.inference_threshold <= 1.0:
@@ -146,8 +151,10 @@ class ProfilerConfig:
             raise ValueError("aggregation_batch_size must be positive")
         if not 0.0 <= self.high_missing_rate <= 1.0:
             raise ValueError("high_missing_rate must be in [0, 1]")
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.safe_cast_sql_function):
-            raise ValueError("safe_cast_sql_function must be a SQL function name")
+        if not 0.0 <= self.percentage_detection_min_numeric_rate <= 1.0:
+            raise ValueError(
+                "percentage_detection_min_numeric_rate must be in [0, 1]"
+            )
 
 
 @dataclass
@@ -156,25 +163,6 @@ class ProfileResult:
 
     profile_df: DataFrame
     suggested_schema: T.StructType
-    silver_expressions: Mapping[str, str]
-    quarantine_predicates: Mapping[str, str]
-
-    def silver_select_sql(self, source: str) -> str:
-        """Return a complete SELECT that applies every suggested conversion."""
-
-        projections = [
-            f"  {expression} AS {_quote_identifier(name)}"
-            for name, expression in self.silver_expressions.items()
-        ]
-        return "SELECT\n" + ",\n".join(projections) + f"\nFROM {source}"
-
-    def schema_ddl(self) -> str:
-        """Return the suggested schema as a comma-separated DDL fragment."""
-
-        return ",\n".join(
-            f"  {_quote_identifier(field.name)} {field.dataType.simpleString().upper()}"
-            for field in self.suggested_schema.fields
-        )
 
 
 @dataclass
@@ -197,7 +185,7 @@ class DataFrameProfiler:
         self.config = config or ProfilerConfig()
 
     def profile(self, df: DataFrame) -> ProfileResult:
-        """Profile ``df`` and return aggregate metrics and silver artifacts."""
+        """Profile ``df`` and return aggregate metrics and a schema recommendation."""
 
         if not isinstance(df, DataFrame):
             raise TypeError("df must be a pyspark.sql.DataFrame")
@@ -213,8 +201,6 @@ class DataFrameProfiler:
             base_stats = self._collect_base_stats(work_df)
             rows: List[Dict[str, Any]] = []
             schema_fields: List[T.StructField] = []
-            expressions: Dict[str, str] = {}
-            quarantine: Dict[str, str] = {}
 
             for ordinal, source_field in enumerate(work_df.schema.fields):
                 base = base_stats[source_field.name]
@@ -232,13 +218,6 @@ class DataFrameProfiler:
                 )
                 invalid_examples = self._collect_invalid_examples(
                     work_df, source_field, spec
-                )
-                silver_expression = self._silver_expression(source_field, spec)
-                invalid_predicate = (
-                    f"{self._clean_sql(source_field.name)} IS NOT NULL AND "
-                    f"({silver_expression}) IS NULL"
-                    if spec.suggested_type != "string"
-                    else "FALSE"
                 )
                 flags = self._quality_flags(
                     source_field,
@@ -259,14 +238,10 @@ class DataFrameProfiler:
                         unique_values,
                         unique_values_complete,
                         invalid_examples,
-                        silver_expression,
-                        invalid_predicate,
                         flags,
                         row_count,
                     )
                 )
-                expressions[source_field.name] = silver_expression
-                quarantine[source_field.name] = invalid_predicate
                 target_type = self._spark_type(source_field, spec.suggested_type)
                 inferred_invalid = max(
                     0, int(base["non_missing_count"]) - spec.inferred_valid_count
@@ -285,8 +260,6 @@ class DataFrameProfiler:
             return ProfileResult(
                 profile_df=profile_df,
                 suggested_schema=T.StructType(schema_fields),
-                silver_expressions=expressions,
-                quarantine_predicates=quarantine,
             )
         finally:
             if persisted_here:
@@ -334,11 +307,18 @@ class DataFrameProfiler:
                 "double_count",
                 "date_count",
                 "timestamp_count",
+                "fractional_percentage_scale_count",
+                "whole_percentage_scale_count",
+                "outside_percentage_range_count",
+                "percentage_symbol_count",
                 "max_integer_digits",
                 "max_decimal_integer_digits",
-                "max_decimal_scale",
             ):
                 values[metric] = _as_int(values.get(metric))
+            values["observed_decimal_scales"] = sorted(
+                int(value)
+                for value in (values.get("observed_decimal_scales") or [])
+            )
             for index, _ in enumerate(self.config.date_formats):
                 metric = f"date_format_{index}_count"
                 values[metric] = _as_int(values.get(metric))
@@ -370,6 +350,14 @@ class DataFrameProfiler:
             F.when(F.length(fractional_part) > 0, F.lit(0)).otherwise(F.lit(1)),
         ).otherwise(F.length(integer_part_no_zeros))
         decimal_scale = F.length(fractional_part)
+        decimal_precision = F.greatest(
+            F.lit(1), decimal_integer_digits + decimal_scale
+        )
+        numeric_value = F.when(double_match, valid_text.cast("double"))
+        numeric_magnitude = F.abs(numeric_value)
+        percentage_symbol_match = valid_text.rlike(
+            r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*%$"
+        )
 
         date_parsers = [self._date_parser(valid_text, fmt) for fmt in self.config.date_formats]
         timestamp_parsers = [
@@ -408,11 +396,28 @@ class DataFrameProfiler:
             "double_count": _count_when(double_match),
             "date_count": _count_when(parsed_date.isNotNull()),
             "timestamp_count": _count_when(parsed_timestamp.isNotNull()),
+            "fractional_percentage_scale_count": _count_when(
+                (numeric_magnitude > 0) & (numeric_magnitude < 1)
+            ),
+            "whole_percentage_scale_count": _count_when(
+                (numeric_magnitude > 1) & (numeric_magnitude <= 100)
+            ),
+            "outside_percentage_range_count": _count_when(
+                numeric_magnitude > 100
+            ),
+            "percentage_symbol_count": _count_when(percentage_symbol_match),
             "max_integer_digits": F.max(F.when(integer_match, integer_digits)),
             "max_decimal_integer_digits": F.max(
                 F.when(decimal_match, decimal_integer_digits)
             ),
+            "min_decimal_scale": F.min(F.when(decimal_match, decimal_scale)),
             "max_decimal_scale": F.max(F.when(decimal_match, decimal_scale)),
+            "max_decimal_precision": F.max(
+                F.when(decimal_match, decimal_precision)
+            ),
+            "observed_decimal_scales": F.sort_array(
+                F.collect_set(F.when(decimal_match, decimal_scale))
+            ),
         }
         for index, parser in enumerate(date_parsers):
             metrics[f"date_format_{index}_count"] = _count_when(parser.isNotNull())
@@ -842,8 +847,6 @@ class DataFrameProfiler:
         unique_values: Sequence[str],
         unique_values_complete: Optional[bool],
         invalid_examples: Sequence[str],
-        silver_expression: str,
-        invalid_predicate: str,
         flags: Sequence[str],
         row_count: int,
     ) -> Dict[str, Any]:
@@ -852,6 +855,7 @@ class DataFrameProfiler:
         invalid = max(0, non_missing - spec.inferred_valid_count)
         distinct = int(base["distinct_count"])
         mode = top_values[0] if top_values else (None, 0, None)
+        percentage = self._percentage_diagnostics(source_field, base)
         return {
             "column_name": source_field.name,
             "ordinal": ordinal,
@@ -889,6 +893,16 @@ class DataFrameProfiler:
             "avg_length": _as_float(base.get("avg_length")),
             "padded_count": int(base["padded_count"]),
             "leading_zero_count": int(base["leading_zero_count"]),
+            "observed_decimal_scales": list(base["observed_decimal_scales"]),
+            "min_observed_decimal_scale": _optional_int(
+                base.get("min_decimal_scale")
+            ),
+            "max_observed_decimal_scale": _optional_int(
+                base.get("max_decimal_scale")
+            ),
+            "max_observed_decimal_precision": _optional_int(
+                base.get("max_decimal_precision")
+            ),
             "negative_count": int(detail.get("negative_count", 0)),
             "zero_count": int(detail.get("zero_count", 0)),
             "true_count": int(detail.get("true_count", 0)),
@@ -908,10 +922,54 @@ class DataFrameProfiler:
             "timestamp_parse_rate": _ratio(
                 int(base["timestamp_count"]), non_missing
             ),
-            "silver_expression": silver_expression,
-            "quarantine_predicate": invalid_predicate,
+            "percentage_name_hint": percentage["name_hint"],
+            "potential_percentage_type": percentage["potential_percentage"],
+            "percentage_symbol_count": int(base["percentage_symbol_count"]),
+            "fractional_percentage_scale_count": int(
+                base["fractional_percentage_scale_count"]
+            ),
+            "whole_percentage_scale_count": int(
+                base["whole_percentage_scale_count"]
+            ),
+            "outside_percentage_range_count": int(
+                base["outside_percentage_range_count"]
+            ),
+            "mixed_percentage_scale_candidate": percentage["mixed_scale"],
+            "percentage_scale_risk": percentage["risk"],
             "quality_flags": list(flags),
             "notes": list(spec.notes),
+        }
+
+    def _percentage_diagnostics(
+        self,
+        source_field: T.StructField,
+        base: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        non_missing = int(base["non_missing_count"])
+        numeric_rate = _ratio(int(base["double_count"]), non_missing) or 0.0
+        normalized_name = re.sub(
+            r"(?<=[a-z0-9])(?=[A-Z])", "_", source_field.name
+        )
+        name_hint = bool(_PERCENTAGE_NAME_RE.search(normalized_name))
+        potential_percentage = bool(name_hint or base["percentage_symbol_count"] > 0)
+        has_fractional_form = int(base["fractional_percentage_scale_count"]) > 0
+        has_whole_form = int(base["whole_percentage_scale_count"]) > 0
+        mixed_scale = bool(
+            numeric_rate >= self.config.percentage_detection_min_numeric_rate
+            and has_fractional_form
+            and has_whole_form
+        )
+        if mixed_scale and (name_hint or base["percentage_symbol_count"] > 0):
+            risk: Optional[str] = "high"
+        elif mixed_scale:
+            risk = "possible"
+        else:
+            risk = None
+        return {
+            "name_hint": name_hint,
+            "potential_percentage": potential_percentage,
+            "mixed_scale": mixed_scale,
+            "risk": risk,
         }
 
     def _quality_flags(
@@ -929,6 +987,7 @@ class DataFrameProfiler:
         invalid = max(0, non_missing - spec.inferred_valid_count)
         distinct = int(base["distinct_count"])
         uniqueness = _uniqueness_ratio(distinct, non_missing)
+        percentage = self._percentage_diagnostics(source_field, base)
 
         if row_count == 0:
             flags.append("empty_dataset")
@@ -948,6 +1007,16 @@ class DataFrameProfiler:
             flags.append("possible_key_verify_with_exact_distinct")
         if base["leading_zero_count"]:
             flags.append("leading_zero_numeric_strings")
+        if len(base["observed_decimal_scales"]) > 1:
+            flags.append("mixed_decimal_scales")
+        if percentage["potential_percentage"]:
+            flags.append("potential_percentage_column")
+        if percentage["mixed_scale"]:
+            flags.append("possible_mixed_percentage_scales")
+        if percentage["risk"] == "high":
+            flags.append("high_risk_mixed_percentage_scales")
+        if base["percentage_symbol_count"] and base["double_count"]:
+            flags.append("mixed_percent_symbol_and_numeric_values")
         if spec.semantic_type == "identifier" and spec.suggested_type == "string":
             flags.append("identifier_preserved_as_string")
         if len(spec.observed_formats) > 1:
@@ -1033,55 +1102,6 @@ class DataFrameProfiler:
         regex = _FORMAT_REGEXES.get(fmt)
         return F.when(value.rlike(regex), parsed) if regex else parsed
 
-    def _silver_expression(
-        self, source_field: T.StructField, spec: _ColumnSpec
-    ) -> str:
-        if not isinstance(source_field.dataType, T.StringType):
-            return _quote_identifier(source_field.name)
-        clean = self._clean_sql(source_field.name)
-        target = spec.suggested_type
-        if target == "string":
-            return clean
-        if target == "boolean":
-            true_values = ", ".join(_sql_literal(value) for value in _TRUE_VALUES)
-            false_values = ", ".join(_sql_literal(value) for value in _FALSE_VALUES)
-            return (
-                f"CASE WHEN LOWER({clean}) IN ({true_values}) THEN TRUE "
-                f"WHEN LOWER({clean}) IN ({false_values}) THEN FALSE ELSE NULL END"
-            )
-        if target == "date":
-            formats = spec.observed_formats or list(self.config.date_formats)
-            conversions = [
-                f"CAST(TRY_TO_TIMESTAMP({clean}, {_sql_literal(fmt)}) AS DATE)"
-                for fmt in formats
-            ]
-            return "COALESCE(" + ", ".join(conversions) + ")"
-        if target in ("timestamp", "timestamp_ntz"):
-            formats = spec.observed_formats or list(self.config.timestamp_formats)
-            conversions = [
-                f"TRY_TO_TIMESTAMP({clean}, {_sql_literal(fmt)})" for fmt in formats
-            ]
-            return "COALESCE(" + ", ".join(conversions) + ")"
-        return f"{self.config.safe_cast_sql_function}({clean} AS {target.upper()})"
-
-    def _clean_sql(self, column_name: str) -> str:
-        raw = f"CAST({_quote_identifier(column_name)} AS STRING)"
-        clean = f"TRIM({raw})" if self.config.trim_strings else raw
-        blank_check = f"TRIM({raw}) = ''"
-        values = tuple(value for value in self.config.null_like_values if value != "")
-        if values:
-            if self.config.case_sensitive_nulls:
-                probe = clean
-                candidates = values
-            else:
-                probe = f"LOWER({clean})"
-                candidates = tuple(value.lower() for value in values)
-            values_sql = ", ".join(_sql_literal(value) for value in candidates)
-            missing = f"{raw} IS NULL OR {blank_check} OR {probe} IN ({values_sql})"
-        else:
-            missing = f"{raw} IS NULL OR {blank_check}"
-        return f"CASE WHEN {missing} THEN NULL ELSE {clean} END"
-
     @staticmethod
     def _spark_type(source_field: T.StructField, target: str) -> T.DataType:
         simple: Dict[str, T.DataType] = {
@@ -1119,7 +1139,7 @@ def profile_dataframe(
 
         result = profile_dataframe(bronze_df)
         result.profile_df.show(truncate=False)
-        print(result.silver_select_sql("bronze.customer"))
+        print(result.suggested_schema.simpleString())
     """
 
     return DataFrameProfiler(config).profile(df)
@@ -1170,6 +1190,10 @@ def _profile_schema() -> T.StructType:
         ("avg_length", T.DoubleType(), True),
         ("padded_count", T.LongType(), False),
         ("leading_zero_count", T.LongType(), False),
+        ("observed_decimal_scales", T.ArrayType(T.IntegerType(), False), False),
+        ("min_observed_decimal_scale", T.IntegerType(), True),
+        ("max_observed_decimal_scale", T.IntegerType(), True),
+        ("max_observed_decimal_precision", T.IntegerType(), True),
         ("negative_count", T.LongType(), False),
         ("zero_count", T.LongType(), False),
         ("true_count", T.LongType(), False),
@@ -1187,8 +1211,14 @@ def _profile_schema() -> T.StructType:
         ("double_parse_rate", T.DoubleType(), True),
         ("date_parse_rate", T.DoubleType(), True),
         ("timestamp_parse_rate", T.DoubleType(), True),
-        ("silver_expression", T.StringType(), False),
-        ("quarantine_predicate", T.StringType(), False),
+        ("percentage_name_hint", T.BooleanType(), False),
+        ("potential_percentage_type", T.BooleanType(), False),
+        ("percentage_symbol_count", T.LongType(), False),
+        ("fractional_percentage_scale_count", T.LongType(), False),
+        ("whole_percentage_scale_count", T.LongType(), False),
+        ("outside_percentage_range_count", T.LongType(), False),
+        ("mixed_percentage_scale_candidate", T.BooleanType(), False),
+        ("percentage_scale_risk", T.StringType(), True),
         ("quality_flags", T.ArrayType(T.StringType(), False), False),
         ("notes", T.ArrayType(T.StringType(), False), False),
     ]
@@ -1205,14 +1235,6 @@ def _coalesce_or_null(expressions: Sequence[Column], data_type: T.DataType) -> C
     if expressions:
         return F.coalesce(*expressions)
     return F.lit(None).cast(data_type)
-
-
-def _quote_identifier(name: str) -> str:
-    return "`" + name.replace("`", "``") + "`"
-
-
-def _sql_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 def _ratio(numerator: int, denominator: int) -> Optional[float]:
