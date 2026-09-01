@@ -5,9 +5,9 @@ The public entry point is :func:`profile_dataframe`.  It returns a
 and a suggested ``StructType``.
 
 The profiler never collects source rows to the driver.  It only collects
-aggregate results, the configured number of top values, and a small sample of
-invalid values.  Exact top values/modes still require a shuffle per profiled
-column and can be disabled through ``ProfilerConfig``.
+aggregate results, bounded value domains, and small invalid-value samples.
+Column work is grouped into configurable batches to keep both Spark job count
+and generated query plans bounded.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -24,6 +25,7 @@ try:
     from pyspark.sql import Column, DataFrame
     from pyspark.sql import functions as F
     from pyspark.sql import types as T
+    from pyspark.sql.window import Window
 except ImportError as exc:  # pragma: no cover - exercised only without PySpark
     raise ImportError(
         "spark_data_profiler requires pyspark. Install it with `pip install pyspark`."
@@ -60,9 +62,7 @@ _FORMAT_REGEXES = {
     "M/d/yyyy": r"^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}$",
     "MM/dd/yyyy": r"^[0-9]{2}/[0-9]{2}/[0-9]{4}$",
     "yyyyMMdd": r"^[0-9]{8}$",
-    "yyyy-MM-dd HH:mm:ss": (
-        r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$"
-    ),
+    "yyyy-MM-dd HH:mm:ss": (r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$"),
     "yyyy-MM-dd HH:mm:ss.SSS": (
         r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}"
         r"\.[0-9]{1,9}$"
@@ -92,10 +92,16 @@ _IDENTIFIER_NAME_RE = re.compile(
 )
 
 _PERCENTAGE_NAME_RE = re.compile(
-    r"(?:^|_)(?:pct|percent|percentage|rate|ratio|share|margin|yield|"
-    r"utilization|utilisation|conversion_rate|discount_rate)(?:$|_)",
+    r"(?:^|_)(?:pct(?:change)?|percent(?:age)?|rate|ratio|share|margin|yield|"
+    r"utilization|utilisation|ctr|apr|roi|irr|roas|cpc)(?:$|_)",
     re.IGNORECASE,
 )
+_NON_PERCENTAGE_AMOUNT_NAME_RE = re.compile(
+    r"(?:^|_)(?:amount|dollars?|price|cost|revenue|sales|value)(?:$|_)",
+    re.IGNORECASE,
+)
+
+_MIN_APPROX_DISTINCT_RSD = 0.000017
 
 
 @dataclass(frozen=True)
@@ -124,22 +130,30 @@ class ProfilerConfig:
     collect_unique_string_values: bool = True
     unique_values_max_cardinality: Optional[int] = 200
     invalid_sample_size: int = 5
-    aggregation_batch_size: int = 40
+    aggregation_batch_size: int = 8
     high_missing_rate: float = 0.20
     categorical_max_distinct: int = 50
     preserve_identifier_strings: bool = True
     percentage_detection_min_numeric_rate: float = 0.80
+    percentage_min_group_count: int = 1
     cache_input: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 < self.inference_threshold <= 1.0:
             raise ValueError("inference_threshold must be in (0, 1]")
-        if not 0.0 < self.approx_distinct_rsd < 1.0:
-            raise ValueError("approx_distinct_rsd must be in (0, 1)")
+        if not _MIN_APPROX_DISTINCT_RSD <= self.approx_distinct_rsd < 1.0:
+            raise ValueError(
+                "approx_distinct_rsd must be at least 0.000017 and less than 1"
+            )
         if self.percentile_accuracy < 1:
             raise ValueError("percentile_accuracy must be positive")
         if self.top_n < 1:
             raise ValueError("top_n must be positive")
+        if (
+            self.top_values_max_cardinality is not None
+            and self.top_values_max_cardinality < 1
+        ):
+            raise ValueError("top_values_max_cardinality must be positive or None")
         if (
             self.unique_values_max_cardinality is not None
             and self.unique_values_max_cardinality < 1
@@ -149,12 +163,32 @@ class ProfilerConfig:
             raise ValueError("invalid_sample_size cannot be negative")
         if self.aggregation_batch_size < 1:
             raise ValueError("aggregation_batch_size must be positive")
+        if self.categorical_max_distinct < 1:
+            raise ValueError("categorical_max_distinct must be positive")
         if not 0.0 <= self.high_missing_rate <= 1.0:
             raise ValueError("high_missing_rate must be in [0, 1]")
         if not 0.0 <= self.percentage_detection_min_numeric_rate <= 1.0:
-            raise ValueError(
-                "percentage_detection_min_numeric_rate must be in [0, 1]"
-            )
+            raise ValueError("percentage_detection_min_numeric_rate must be in [0, 1]")
+        if self.percentage_min_group_count < 1:
+            raise ValueError("percentage_min_group_count must be positive")
+        for setting_name, formats in (
+            ("date_formats", self.date_formats),
+            ("timestamp_formats", self.timestamp_formats),
+        ):
+            if isinstance(formats, (str, bytes)):
+                raise ValueError(f"{setting_name} must be a sequence of format strings")
+            try:
+                invalid_format = any(
+                    not isinstance(fmt, str) or not fmt.strip() for fmt in formats
+                )
+            except TypeError as exc:
+                raise ValueError(
+                    f"{setting_name} must be a sequence of format strings"
+                ) from exc
+            if invalid_format:
+                raise ValueError(
+                    f"{setting_name} must contain only non-empty format strings"
+                )
 
 
 @dataclass
@@ -178,17 +212,53 @@ class _ColumnSpec:
     notes: List[str] = field(default_factory=list)
 
 
+_ProfileContext = Tuple[int, T.StructField, Mapping[str, Any], _ColumnSpec]
+
+
 class DataFrameProfiler:
     """Profile a Spark DataFrame for bronze-to-silver promotion decisions."""
 
     def __init__(self, config: Optional[ProfilerConfig] = None) -> None:
         self.config = config or ProfilerConfig()
 
+    def _validate_datetime_formats(self, df: DataFrame) -> None:
+        """Fail early on invalid Java datetime patterns when a JVM is available."""
+
+        jvm = getattr(df.sparkSession, "_jvm", None)
+        if jvm is None:  # Spark Connect does not expose the embedded JVM.
+            return
+        for setting_name, formats in (
+            ("date_formats", self.config.date_formats),
+            ("timestamp_formats", self.config.timestamp_formats),
+        ):
+            for fmt in formats:
+                try:
+                    jvm.java.time.format.DateTimeFormatter.ofPattern(fmt)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid Java datetime pattern in {setting_name}: {fmt!r}"
+                    ) from exc
+
     def profile(self, df: DataFrame) -> ProfileResult:
         """Profile ``df`` and return aggregate metrics and a schema recommendation."""
 
         if not isinstance(df, DataFrame):
             raise TypeError("df must be a pyspark.sql.DataFrame")
+        version_match = re.match(r"^(\d+)\.(\d+)", df.sparkSession.version)
+        if version_match and tuple(map(int, version_match.groups())) < (3, 5):
+            raise RuntimeError("spark_data_profiler requires Apache Spark 3.5 or newer")
+
+        duplicate_names = sorted(
+            name for name, count in Counter(df.columns).items() if count > 1
+        )
+        if duplicate_names:
+            joined = ", ".join(repr(name) for name in duplicate_names)
+            raise ValueError(
+                "DataFrame columns must be unique before profiling; duplicate "
+                f"column name(s): {joined}. Alias duplicate columns first."
+            )
+
+        self._validate_datetime_formats(df)
 
         persisted_here = False
         work_df = df
@@ -201,24 +271,35 @@ class DataFrameProfiler:
             base_stats = self._collect_base_stats(work_df)
             rows: List[Dict[str, Any]] = []
             schema_fields: List[T.StructField] = []
-
-            for ordinal, source_field in enumerate(work_df.schema.fields):
-                base = base_stats[source_field.name]
-                spec = self._infer_column(source_field, base, row_count)
-                detail = self._collect_detail(work_df, source_field, spec)
-                top_values, top_skipped = self._collect_top_values(
-                    work_df, source_field, spec, base
+            contexts = [
+                (
+                    ordinal,
+                    source_field,
+                    base_stats[source_field.name],
+                    self._infer_column(
+                        source_field, base_stats[source_field.name], row_count
+                    ),
                 )
+                for ordinal, source_field in enumerate(work_df.schema.fields)
+            ]
+            details = self._collect_details(work_df, contexts)
+            top_value_results = self._collect_top_values_batched(work_df, contexts)
+            unique_value_results = self._collect_unique_string_values_batched(
+                work_df, contexts
+            )
+            invalid_example_results = self._collect_invalid_examples_batched(
+                work_df, contexts
+            )
+
+            for ordinal, source_field, base, spec in contexts:
+                detail = details[ordinal]
+                top_values, top_skipped = top_value_results[ordinal]
                 (
                     unique_values,
                     unique_values_complete,
                     unique_values_skipped,
-                ) = self._collect_unique_string_values(
-                    work_df, source_field, spec, base
-                )
-                invalid_examples = self._collect_invalid_examples(
-                    work_df, source_field, spec
-                )
+                ) = unique_value_results[ordinal]
+                invalid_examples = invalid_example_results[ordinal]
                 flags = self._quality_flags(
                     source_field,
                     base,
@@ -311,13 +392,16 @@ class DataFrameProfiler:
                 "whole_percentage_scale_count",
                 "outside_percentage_range_count",
                 "percentage_symbol_count",
+                "nan_count",
+                "positive_infinity_count",
+                "negative_infinity_count",
+                "non_finite_count",
                 "max_integer_digits",
                 "max_decimal_integer_digits",
             ):
                 values[metric] = _as_int(values.get(metric))
             values["observed_decimal_scales"] = sorted(
-                int(value)
-                for value in (values.get("observed_decimal_scales") or [])
+                int(value) for value in (values.get("observed_decimal_scales") or [])
             )
             for index, _ in enumerate(self.config.date_formats):
                 metric = f"date_format_{index}_count"
@@ -327,7 +411,9 @@ class DataFrameProfiler:
                 values[metric] = _as_int(values.get(metric))
         return results
 
-    def _base_metric_expressions(self, source_field: T.StructField) -> Dict[str, Column]:
+    def _base_metric_expressions(
+        self, source_field: T.StructField
+    ) -> Dict[str, Column]:
         raw, text, clean, missing, blank, null_like = self._text_components(
             source_field
         )
@@ -339,9 +425,9 @@ class DataFrameProfiler:
 
         signless = F.regexp_replace(valid_text, r"^[+-]", "")
         integer_digits_text = F.regexp_replace(signless, r"^0+", "")
-        integer_digits = F.when(
-            F.length(integer_digits_text) == 0, F.lit(1)
-        ).otherwise(F.length(integer_digits_text))
+        integer_digits = F.when(F.length(integer_digits_text) == 0, F.lit(1)).otherwise(
+            F.length(integer_digits_text)
+        )
         integer_part = F.regexp_extract(signless, r"^([0-9]*)", 1)
         integer_part_no_zeros = F.regexp_replace(integer_part, r"^0+", "")
         fractional_part = F.regexp_extract(signless, r"\.([0-9]+)$", 1)
@@ -350,16 +436,25 @@ class DataFrameProfiler:
             F.when(F.length(fractional_part) > 0, F.lit(0)).otherwise(F.lit(1)),
         ).otherwise(F.length(integer_part_no_zeros))
         decimal_scale = F.length(fractional_part)
-        decimal_precision = F.greatest(
-            F.lit(1), decimal_integer_digits + decimal_scale
-        )
+        decimal_precision = F.greatest(F.lit(1), decimal_integer_digits + decimal_scale)
         numeric_value = F.when(double_match, valid_text.cast("double"))
         numeric_magnitude = F.abs(numeric_value)
         percentage_symbol_match = valid_text.rlike(
             r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*%$"
         )
+        floating_source = isinstance(source_field.dataType, (T.FloatType, T.DoubleType))
+        if floating_source:
+            nan_match = F.isnan(raw)
+            positive_infinity_match = raw == F.lit(float("inf"))
+            negative_infinity_match = raw == F.lit(float("-inf"))
+        else:
+            nan_match = F.lit(False)
+            positive_infinity_match = F.lit(False)
+            negative_infinity_match = F.lit(False)
 
-        date_parsers = [self._date_parser(valid_text, fmt) for fmt in self.config.date_formats]
+        date_parsers = [
+            self._date_parser(valid_text, fmt) for fmt in self.config.date_formats
+        ]
         timestamp_parsers = [
             self._timestamp_parser(valid_text, fmt)
             for fmt in self.config.timestamp_formats
@@ -373,6 +468,11 @@ class DataFrameProfiler:
             distinct = F.approx_count_distinct(
                 valid_text, rsd=self.config.approx_distinct_rsd
             )
+        padded_match = (
+            raw.isNotNull() & (text != F.trim(text))
+            if isinstance(source_field.dataType, T.StringType)
+            else F.lit(False)
+        )
 
         metrics: Dict[str, Column] = {
             "null_count": _count_when(raw.isNull()),
@@ -380,9 +480,7 @@ class DataFrameProfiler:
             "null_like_count": _count_when(null_like),
             "missing_count": _count_when(missing),
             "non_missing_count": _count_when(~missing),
-            "padded_count": _count_when(
-                raw.isNotNull() & (text != F.trim(text))
-            ),
+            "padded_count": _count_when(padded_match),
             "distinct_count": distinct,
             "min_length": F.min(F.length(valid_text)),
             "max_length": F.max(F.length(valid_text)),
@@ -402,19 +500,21 @@ class DataFrameProfiler:
             "whole_percentage_scale_count": _count_when(
                 (numeric_magnitude > 1) & (numeric_magnitude <= 100)
             ),
-            "outside_percentage_range_count": _count_when(
-                numeric_magnitude > 100
-            ),
+            "outside_percentage_range_count": _count_when(numeric_magnitude > 100),
             "percentage_symbol_count": _count_when(percentage_symbol_match),
+            "nan_count": _count_when(nan_match),
+            "positive_infinity_count": _count_when(positive_infinity_match),
+            "negative_infinity_count": _count_when(negative_infinity_match),
+            "non_finite_count": _count_when(
+                nan_match | positive_infinity_match | negative_infinity_match
+            ),
             "max_integer_digits": F.max(F.when(integer_match, integer_digits)),
             "max_decimal_integer_digits": F.max(
                 F.when(decimal_match, decimal_integer_digits)
             ),
             "min_decimal_scale": F.min(F.when(decimal_match, decimal_scale)),
             "max_decimal_scale": F.max(F.when(decimal_match, decimal_scale)),
-            "max_decimal_precision": F.max(
-                F.when(decimal_match, decimal_precision)
-            ),
+            "max_decimal_precision": F.max(F.when(decimal_match, decimal_precision)),
             "observed_decimal_scales": F.sort_array(
                 F.collect_set(F.when(decimal_match, decimal_scale))
             ),
@@ -422,9 +522,7 @@ class DataFrameProfiler:
         for index, parser in enumerate(date_parsers):
             metrics[f"date_format_{index}_count"] = _count_when(parser.isNotNull())
         for index, parser in enumerate(timestamp_parsers):
-            metrics[f"timestamp_format_{index}_count"] = _count_when(
-                parser.isNotNull()
-            )
+            metrics[f"timestamp_format_{index}_count"] = _count_when(parser.isNotNull())
         return metrics
 
     def _infer_column(
@@ -481,14 +579,21 @@ class DataFrameProfiler:
             key=lambda name: (candidate_rates[name], -priority.index(name)),
         )
         best_rate = candidate_rates[best_candidate]
+        yyyymmdd_ambiguity = self._yyyymmdd_integer_ambiguity(base, non_missing)
+        if best_candidate == "date" and yyyymmdd_ambiguity:
+            best_candidate = "integer"
+            best_rate = candidate_rates["integer"]
 
         accepted = (
-            best_candidate
-            if best_rate >= self.config.inference_threshold
-            else None
+            best_candidate if best_rate >= self.config.inference_threshold else None
         )
         notes: List[str] = []
         observed_formats: List[str] = []
+        if yyyymmdd_ambiguity:
+            notes.append(
+                "Values match both yyyyMMdd dates and 8-digit integers; integer "
+                "is preferred until date semantics are confirmed."
+            )
 
         if accepted is None:
             inferred = "string"
@@ -536,6 +641,14 @@ class DataFrameProfiler:
 
         semantic = self._semantic_type(source_field, inferred, base, uniqueness)
         if (
+            inferred == "boolean"
+            and candidate_counts["boolean"] == non_missing
+            and candidate_counts["integer"] == non_missing
+        ):
+            notes.append(
+                "The observed 0/1 domain is valid as both boolean and integer."
+            )
+        if (
             self.config.preserve_identifier_strings
             and semantic == "identifier"
             and inferred != "string"
@@ -555,6 +668,22 @@ class DataFrameProfiler:
             inferred_valid_count=valid_count,
             observed_formats=observed_formats,
             notes=notes,
+        )
+
+    def _yyyymmdd_integer_ambiguity(
+        self, base: Mapping[str, Any], non_missing: int
+    ) -> bool:
+        if not non_missing:
+            return False
+        matching_formats = {
+            fmt
+            for index, fmt in enumerate(self.config.date_formats)
+            if int(base[f"date_format_{index}_count"]) > 0
+        }
+        return bool(
+            matching_formats == {"yyyyMMdd"}
+            and int(base["date_count"]) == non_missing
+            and int(base["integer_count"]) == non_missing
         )
 
     def _semantic_type(
@@ -593,104 +722,129 @@ class DataFrameProfiler:
             (fmt, int(base[f"{prefix}_format_{index}_count"]))
             for index, fmt in enumerate(formats)
         ]
-        return [fmt for fmt, count in sorted(counts, key=lambda item: -item[1]) if count]
+        return [
+            fmt for fmt, count in sorted(counts, key=lambda item: -item[1]) if count
+        ]
 
-    def _collect_detail(
-        self, df: DataFrame, source_field: T.StructField, spec: _ColumnSpec
-    ) -> Dict[str, Any]:
+    def _collect_details(
+        self, df: DataFrame, contexts: Sequence[_ProfileContext]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Collect detailed aggregates in bounded multi-column Spark jobs."""
+
+        results: Dict[int, Dict[str, Any]] = {}
+        batch_size = self.config.aggregation_batch_size
+        for start in range(0, len(contexts), batch_size):
+            batch = contexts[start : start + batch_size]
+            expressions: List[Column] = []
+            aliases: Dict[str, Tuple[int, str]] = {}
+            targets: Dict[int, str] = {}
+            for ordinal, source_field, _, spec in batch:
+                targets[ordinal] = spec.suggested_type
+                for metric_name, expression in self._detail_metric_expressions(
+                    source_field, spec
+                ).items():
+                    alias = f"d{ordinal}__{metric_name}"
+                    expressions.append(expression.alias(alias))
+                    aliases[alias] = (ordinal, metric_name)
+
+            if not expressions:
+                continue
+            aggregated = df.agg(*expressions).first().asDict()
+            raw_results: Dict[int, Dict[str, Any]] = defaultdict(dict)
+            for alias, value in aggregated.items():
+                ordinal, metric_name = aliases[alias]
+                raw_results[ordinal][metric_name] = value
+            for ordinal, values in raw_results.items():
+                results[ordinal] = self._normalize_detail(values, targets[ordinal])
+        return results
+
+    def _detail_metric_expressions(
+        self, source_field: T.StructField, spec: _ColumnSpec
+    ) -> Dict[str, Column]:
         parsed = self._parsed_expr(source_field, spec.suggested_type, spec)
         target = spec.suggested_type
-        metrics: List[Column] = []
+        metrics: Dict[str, Column] = {}
 
         numeric = _is_numeric_type(target)
         boolean = target == "boolean"
         date_type = target == "date"
         timestamp_type = target in ("timestamp", "timestamp_ntz")
         orderable = numeric or date_type or timestamp_type or target == "string"
+        timestamp_micros = (
+            self._timestamp_micros(parsed, target) if timestamp_type else None
+        )
 
         if boolean:
-            metrics.extend(
-                [
-                    F.min(parsed.cast("integer")).alias("min_value"),
-                    F.max(parsed.cast("integer")).alias("max_value"),
-                ]
-            )
+            metrics["min_value"] = F.min(parsed.cast("integer"))
+            metrics["max_value"] = F.max(parsed.cast("integer"))
+        elif timestamp_type:
+            metrics["min_value"] = F.min(timestamp_micros)
+            metrics["max_value"] = F.max(timestamp_micros)
         elif orderable:
-            metrics.extend(
-                [F.min(parsed).alias("min_value"), F.max(parsed).alias("max_value")]
-            )
+            metrics["min_value"] = F.min(parsed)
+            metrics["max_value"] = F.max(parsed)
         else:
-            metrics.extend(
-                [
-                    F.lit(None).cast("string").alias("min_value"),
-                    F.lit(None).cast("string").alias("max_value"),
-                ]
-            )
+            metrics["min_value"] = _aggregate_literal(None, "string")
+            metrics["max_value"] = _aggregate_literal(None, "string")
 
         quantile_source: Optional[Column] = None
         if numeric:
-            quantile_source = parsed
-            metrics.extend(
-                [
-                    F.avg(parsed).alias("mean"),
-                    F.stddev_samp(parsed).alias("stddev"),
-                    _count_when(parsed < 0).alias("negative_count"),
-                    _count_when(parsed == 0).alias("zero_count"),
-                ]
-            )
+            numeric_double = parsed.cast("double")
+            quantile_source = numeric_double
+            metrics["mean"] = F.avg(numeric_double)
+            metrics["stddev"] = F.stddev_samp(numeric_double)
+            metrics["negative_count"] = _count_when(parsed < 0)
+            metrics["zero_count"] = _count_when(parsed == 0)
         elif boolean:
             numeric_boolean = parsed.cast("integer")
             quantile_source = numeric_boolean
-            metrics.extend(
-                [
-                    F.avg(numeric_boolean).alias("mean"),
-                    F.stddev_samp(numeric_boolean).alias("stddev"),
-                    F.lit(0).cast("long").alias("negative_count"),
-                    _count_when(~parsed).alias("zero_count"),
-                ]
-            )
+            metrics["mean"] = F.avg(numeric_boolean)
+            metrics["stddev"] = F.stddev_samp(numeric_boolean)
+            metrics["negative_count"] = _aggregate_literal(0, "long")
+            metrics["zero_count"] = _count_when(~parsed)
         elif date_type:
             quantile_source = F.datediff(parsed, F.lit("1970-01-01"))
-            metrics.extend(self._empty_numeric_metrics())
+            metrics.update(self._empty_numeric_metrics())
         elif timestamp_type:
-            quantile_source = parsed.cast("double")
-            metrics.extend(self._empty_numeric_metrics())
+            quantile_source = timestamp_micros
+            metrics.update(self._empty_numeric_metrics())
         else:
-            metrics.extend(self._empty_numeric_metrics())
+            metrics.update(self._empty_numeric_metrics())
 
         if quantile_source is not None:
-            metrics.append(
-                F.percentile_approx(
-                    quantile_source,
-                    [0.25, 0.5, 0.75],
-                    self.config.percentile_accuracy,
-                ).alias("quantiles")
+            metrics["quantiles"] = F.percentile_approx(
+                quantile_source,
+                [0.25, 0.5, 0.75],
+                self.config.percentile_accuracy,
             )
         else:
-            metrics.append(
-                F.lit(None).cast(T.ArrayType(T.DoubleType())).alias("quantiles")
-            )
+            metrics["quantiles"] = _aggregate_literal(None, T.ArrayType(T.DoubleType()))
 
         if boolean:
-            metrics.extend(
-                [
-                    _count_when(parsed).alias("true_count"),
-                    _count_when(~parsed).alias("false_count"),
-                ]
-            )
+            metrics["true_count"] = _count_when(parsed)
+            metrics["false_count"] = _count_when(~parsed)
         else:
-            metrics.extend(
-                [
-                    F.lit(0).cast("long").alias("true_count"),
-                    F.lit(0).cast("long").alias("false_count"),
-                ]
-            )
+            metrics["true_count"] = _aggregate_literal(0, "long")
+            metrics["false_count"] = _aggregate_literal(0, "long")
+        return metrics
 
-        values = df.agg(*metrics).first().asDict()
+    def _normalize_detail(
+        self, raw_values: Mapping[str, Any], target: str
+    ) -> Dict[str, Any]:
+        values = dict(raw_values)
         quantiles = values.pop("quantiles", None)
+        boolean = target == "boolean"
+        timestamp_type = target in ("timestamp", "timestamp_ntz")
         if boolean:
             values["min_value"] = _boolean_string(values.get("min_value"))
             values["max_value"] = _boolean_string(values.get("max_value"))
+        elif timestamp_type:
+            values["min_value"] = _format_timestamp_micros(
+                values.get("min_value"), target
+            )
+            values["max_value"] = _format_timestamp_micros(
+                values.get("max_value"), target
+            )
         else:
             values["min_value"] = _stringify(values.get("min_value"))
             values["max_value"] = _stringify(values.get("max_value"))
@@ -704,13 +858,30 @@ class DataFrameProfiler:
         return values
 
     @staticmethod
-    def _empty_numeric_metrics() -> List[Column]:
-        return [
-            F.lit(None).cast("double").alias("mean"),
-            F.lit(None).cast("double").alias("stddev"),
-            F.lit(0).cast("long").alias("negative_count"),
-            F.lit(0).cast("long").alias("zero_count"),
-        ]
+    def _empty_numeric_metrics() -> Dict[str, Column]:
+        return {
+            "mean": _aggregate_literal(None, "double"),
+            "stddev": _aggregate_literal(None, "double"),
+            "negative_count": _aggregate_literal(0, "long"),
+            "zero_count": _aggregate_literal(0, "long"),
+        }
+
+    @staticmethod
+    def _timestamp_micros(value: Column, target: str) -> Column:
+        if target == "timestamp_ntz":
+            days = F.datediff(value.cast("date"), F.lit("1970-01-01")).cast("long")
+            seconds = (
+                F.hour(value).cast("long") * F.lit(3_600)
+                + F.minute(value).cast("long") * F.lit(60)
+                + F.second(value).cast("long")
+            )
+            fractional_micros = F.date_format(value, "SSSSSS").cast("long")
+            return (
+                days * F.lit(86_400_000_000)
+                + seconds * F.lit(1_000_000)
+                + fractional_micros
+            ).cast("long")
+        return F.unix_micros(value)
 
     def _convert_quantiles(
         self, quantiles: Optional[Sequence[Any]], target: str
@@ -727,114 +898,202 @@ class DataFrameProfiler:
             )
         if target in ("timestamp", "timestamp_ntz"):
             return tuple(  # type: ignore[return-value]
-                dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-                if value is not None
-                else None
-                for value in quantiles
+                _format_timestamp_micros(value, target) for value in quantiles
             )
         if target == "boolean":
             return tuple(  # type: ignore[return-value]
-                "true" if value is not None and float(value) >= 1.0 else "false"
+                "true"
+                if value is not None and float(value) >= 1.0
+                else "false"
                 if value is not None
                 else None
                 for value in quantiles
             )
         return tuple(_stringify(value) for value in quantiles)  # type: ignore[return-value]
 
-    def _collect_top_values(
-        self,
-        df: DataFrame,
-        source_field: T.StructField,
-        spec: _ColumnSpec,
-        base: Mapping[str, Any],
-    ) -> Tuple[List[Tuple[str, int, Optional[float]]], bool]:
+    def _collect_top_values_batched(
+        self, df: DataFrame, contexts: Sequence[_ProfileContext]
+    ) -> Dict[int, Tuple[List[Tuple[str, int, Optional[float]]], bool]]:
+        results: Dict[int, Tuple[List[Tuple[str, int, Optional[float]]], bool]] = {
+            ordinal: ([], True) for ordinal, _, _, _ in contexts
+        }
         if not self.config.calculate_top_values:
-            return [], True
+            return results
+
         threshold = self.config.top_values_max_cardinality
-        if threshold is not None and int(base["distinct_count"]) > threshold:
-            return [], True
+        eligible = [
+            context
+            for context in contexts
+            if threshold is None or int(context[2]["distinct_count"]) <= threshold
+        ]
+        for ordinal, _, _, _ in eligible:
+            results[ordinal] = ([], False)
 
-        parsed = self._parsed_expr(source_field, spec.suggested_type, spec)
-        value = parsed.cast("string").alias("_profile_value")
-        counts = (
-            df.select(value)
-            .where(F.col("_profile_value").isNotNull())
-            .groupBy("_profile_value")
-            .count()
-            .orderBy(F.desc("count"), F.asc("_profile_value"))
-            .limit(self.config.top_n)
-            .collect()
-        )
-        denominator = int(base["non_missing_count"])
-        return [
-            (
-                str(row["_profile_value"]),
-                int(row["count"]),
-                _ratio(int(row["count"]), denominator),
+        batch_size = self.config.aggregation_batch_size
+        for start in range(0, len(eligible), batch_size):
+            batch = eligible[start : start + batch_size]
+            entries = [
+                F.struct(
+                    F.lit(ordinal).cast("integer").alias("ordinal"),
+                    self._parsed_expr(source_field, spec.suggested_type, spec)
+                    .cast("string")
+                    .alias("value"),
+                )
+                for ordinal, source_field, _, spec in batch
+            ]
+            if not entries:
+                continue
+            long_values = (
+                df.select(F.explode(F.array(*entries)).alias("profile_value"))
+                .select("profile_value.*")
+                .where(F.col("value").isNotNull())
             )
-            for row in counts
-        ], False
+            counts = long_values.groupBy("ordinal", "value").count()
+            rank_window = Window.partitionBy("ordinal").orderBy(
+                F.desc("count"), F.asc("value")
+            )
+            rows = (
+                counts.withColumn("rank", F.row_number().over(rank_window))
+                .where(F.col("rank") <= self.config.top_n)
+                .orderBy("ordinal", "rank")
+                .collect()
+            )
+            grouped: Dict[int, List[Tuple[str, int, Optional[float]]]] = defaultdict(
+                list
+            )
+            denominators = {
+                ordinal: int(base["non_missing_count"]) for ordinal, _, base, _ in batch
+            }
+            for row in rows:
+                ordinal = int(row["ordinal"])
+                count = int(row["count"])
+                grouped[ordinal].append(
+                    (str(row["value"]), count, _ratio(count, denominators[ordinal]))
+                )
+            for ordinal, _, _, _ in batch:
+                results[ordinal] = (grouped[ordinal], False)
+        return results
 
-    def _collect_unique_string_values(
-        self,
-        df: DataFrame,
-        source_field: T.StructField,
-        spec: _ColumnSpec,
-        base: Mapping[str, Any],
-    ) -> Tuple[List[str], Optional[bool], bool]:
-        """Collect the complete normalized domain for bounded string columns."""
+    def _collect_unique_string_values_batched(
+        self, df: DataFrame, contexts: Sequence[_ProfileContext]
+    ) -> Dict[int, Tuple[List[str], Optional[bool], bool]]:
+        """Collect normalized string domains in bounded multi-column jobs."""
 
-        if not isinstance(source_field.dataType, T.StringType):
-            return [], None, False
+        results: Dict[int, Tuple[List[str], Optional[bool], bool]] = {
+            ordinal: ([], None, False) for ordinal, _, _, _ in contexts
+        }
+        string_contexts = [
+            context
+            for context in contexts
+            if isinstance(context[1].dataType, T.StringType)
+        ]
         if not self.config.collect_unique_string_values:
-            return [], False, True
+            for ordinal, _, _, _ in string_contexts:
+                results[ordinal] = ([], False, True)
+            return results
 
         limit = self.config.unique_values_max_cardinality
-        # This inexpensive approximate precheck avoids a distinct shuffle for obvious
-        # IDs/free text. A near-boundary approximate overcount can conservatively skip.
-        if limit is not None and int(base["distinct_count"]) > limit:
-            return [], False, True
+        eligible: List[_ProfileContext] = []
+        for context in string_contexts:
+            ordinal, _, base, _ = context
+            if limit is not None and int(base["distinct_count"]) > limit:
+                results[ordinal] = ([], False, True)
+            else:
+                eligible.append(context)
+                results[ordinal] = ([], True, False)
 
-        parsed = self._parsed_expr(source_field, "string", spec)
-        value = parsed.cast("string").alias("_profile_unique_value")
-        domain = (
-            df.select(value)
-            .where(F.col("_profile_unique_value").isNotNull())
-            .distinct()
-            .orderBy("_profile_unique_value")
-        )
-        rows = (
-            domain.limit(limit + 1).collect()
-            if limit is not None
-            else domain.collect()
-        )
-        if limit is not None and len(rows) > limit:
-            return [], False, True
-        return [str(row["_profile_unique_value"]) for row in rows], True, False
+        batch_size = self.config.aggregation_batch_size
+        for start in range(0, len(eligible), batch_size):
+            batch = eligible[start : start + batch_size]
+            entries = [
+                F.struct(
+                    F.lit(ordinal).cast("integer").alias("ordinal"),
+                    self._parsed_expr(source_field, "string", spec)
+                    .cast("string")
+                    .alias("value"),
+                )
+                for ordinal, source_field, _, spec in batch
+            ]
+            if not entries:
+                continue
+            domain = (
+                df.select(F.explode(F.array(*entries)).alias("profile_value"))
+                .select("profile_value.*")
+                .where(F.col("value").isNotNull())
+                .distinct()
+            )
+            rank_window = Window.partitionBy("ordinal").orderBy(F.asc("value"))
+            ranked = domain.withColumn("rank", F.row_number().over(rank_window))
+            if limit is not None:
+                ranked = ranked.where(F.col("rank") <= limit + 1)
+            rows = ranked.orderBy("ordinal", "rank").collect()
+            grouped: Dict[int, List[str]] = defaultdict(list)
+            for row in rows:
+                grouped[int(row["ordinal"])].append(str(row["value"]))
+            for ordinal, _, _, _ in batch:
+                values = grouped[ordinal]
+                if limit is not None and len(values) > limit:
+                    results[ordinal] = ([], False, True)
+                else:
+                    results[ordinal] = (values, True, False)
+        return results
 
-    def _collect_invalid_examples(
-        self, df: DataFrame, source_field: T.StructField, spec: _ColumnSpec
-    ) -> List[str]:
-        missing = self._text_components(source_field)[3]
-        if (
-            self.config.invalid_sample_size == 0
-            or spec.inferred_type == "string"
-            or not isinstance(source_field.dataType, T.StringType)
-        ):
-            return []
-        parsed = self._parsed_expr(source_field, spec.inferred_type, spec)
-        raw_text = F.col(source_field.name).cast("string")
-        rows = (
-            df.where((~missing) & parsed.isNull())
-            .select(raw_text.alias("value"))
-            .distinct()
-            .orderBy("value")
-            .limit(self.config.invalid_sample_size)
-            .collect()
-        )
-        return [str(row["value"]) for row in rows]
+    def _collect_invalid_examples_batched(
+        self, df: DataFrame, contexts: Sequence[_ProfileContext]
+    ) -> Dict[int, List[str]]:
+        results: Dict[int, List[str]] = {ordinal: [] for ordinal, _, _, _ in contexts}
+        if self.config.invalid_sample_size == 0:
+            return results
+
+        eligible = [
+            context
+            for context in contexts
+            if isinstance(context[1].dataType, T.StringType)
+            and context[3].inferred_type != "string"
+            and int(context[2]["non_missing_count"]) > context[3].inferred_valid_count
+        ]
+        batch_size = self.config.aggregation_batch_size
+        for start in range(0, len(eligible), batch_size):
+            batch = eligible[start : start + batch_size]
+            entries = [
+                F.struct(
+                    F.lit(ordinal).cast("integer").alias("ordinal"),
+                    self._invalid_value_expression(source_field, spec).alias("value"),
+                )
+                for ordinal, source_field, _, spec in batch
+            ]
+            if not entries:
+                continue
+            invalid_values = (
+                df.select(F.explode(F.array(*entries)).alias("invalid_value"))
+                .select("invalid_value.*")
+                .where(F.col("value").isNotNull())
+                .distinct()
+            )
+            rank_window = Window.partitionBy("ordinal").orderBy(F.asc("value"))
+            rows = (
+                invalid_values.withColumn("rank", F.row_number().over(rank_window))
+                .where(F.col("rank") <= self.config.invalid_sample_size)
+                .orderBy("ordinal", "rank")
+                .collect()
+            )
+            for row in rows:
+                results[int(row["ordinal"])].append(str(row["value"]))
+        return results
+
+    def _invalid_value_expression(
+        self, source_field: T.StructField, spec: _ColumnSpec
+    ) -> Column:
+        raw, _, clean, missing, _, _ = self._text_components(source_field)
+        if spec.inferred_type.startswith("integer (>38"):
+            valid = clean.rlike(_INTEGER_RE)
+        elif spec.inferred_type.startswith("decimal ("):
+            valid = clean.rlike(_DECIMAL_RE)
+        else:
+            valid = self._parsed_expr(
+                source_field, spec.inferred_type, spec
+            ).isNotNull()
+        return F.when((~missing) & (~valid), raw.cast("string"))
 
     def _profile_row(
         self,
@@ -893,13 +1152,13 @@ class DataFrameProfiler:
             "avg_length": _as_float(base.get("avg_length")),
             "padded_count": int(base["padded_count"]),
             "leading_zero_count": int(base["leading_zero_count"]),
+            "nan_count": int(base["nan_count"]),
+            "positive_infinity_count": int(base["positive_infinity_count"]),
+            "negative_infinity_count": int(base["negative_infinity_count"]),
+            "non_finite_count": int(base["non_finite_count"]),
             "observed_decimal_scales": list(base["observed_decimal_scales"]),
-            "min_observed_decimal_scale": _optional_int(
-                base.get("min_decimal_scale")
-            ),
-            "max_observed_decimal_scale": _optional_int(
-                base.get("max_decimal_scale")
-            ),
+            "min_observed_decimal_scale": _optional_int(base.get("min_decimal_scale")),
+            "max_observed_decimal_scale": _optional_int(base.get("max_decimal_scale")),
             "max_observed_decimal_precision": _optional_int(
                 base.get("max_decimal_precision")
             ),
@@ -919,21 +1178,19 @@ class DataFrameProfiler:
             "decimal_parse_rate": _ratio(int(base["decimal_count"]), non_missing),
             "double_parse_rate": _ratio(int(base["double_count"]), non_missing),
             "date_parse_rate": _ratio(int(base["date_count"]), non_missing),
-            "timestamp_parse_rate": _ratio(
-                int(base["timestamp_count"]), non_missing
-            ),
+            "timestamp_parse_rate": _ratio(int(base["timestamp_count"]), non_missing),
             "percentage_name_hint": percentage["name_hint"],
             "potential_percentage_type": percentage["potential_percentage"],
+            "percentage_evidence_rate": percentage["evidence_rate"],
             "percentage_symbol_count": int(base["percentage_symbol_count"]),
             "fractional_percentage_scale_count": int(
                 base["fractional_percentage_scale_count"]
             ),
-            "whole_percentage_scale_count": int(
-                base["whole_percentage_scale_count"]
-            ),
+            "whole_percentage_scale_count": int(base["whole_percentage_scale_count"]),
             "outside_percentage_range_count": int(
                 base["outside_percentage_range_count"]
             ),
+            "numeric_range_spans_unit": percentage["range_spans_unit"],
             "mixed_percentage_scale_candidate": percentage["mixed_scale"],
             "percentage_scale_risk": percentage["risk"],
             "quality_flags": list(flags),
@@ -946,28 +1203,43 @@ class DataFrameProfiler:
         base: Mapping[str, Any],
     ) -> Dict[str, Any]:
         non_missing = int(base["non_missing_count"])
-        numeric_rate = _ratio(int(base["double_count"]), non_missing) or 0.0
-        normalized_name = re.sub(
-            r"(?<=[a-z0-9])(?=[A-Z])", "_", source_field.name
+        numeric_count = int(base["double_count"])
+        symbol_count = int(base["percentage_symbol_count"])
+        evidence_rate = _ratio(numeric_count + symbol_count, non_missing) or 0.0
+        normalized_name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", source_field.name)
+        name_hint = bool(
+            _PERCENTAGE_NAME_RE.search(normalized_name)
+            and not _NON_PERCENTAGE_AMOUNT_NAME_RE.search(normalized_name)
         )
-        name_hint = bool(_PERCENTAGE_NAME_RE.search(normalized_name))
-        potential_percentage = bool(name_hint or base["percentage_symbol_count"] > 0)
-        has_fractional_form = int(base["fractional_percentage_scale_count"]) > 0
-        has_whole_form = int(base["whole_percentage_scale_count"]) > 0
+        potential_percentage = bool(name_hint or symbol_count > 0)
+        fractional_count = int(base["fractional_percentage_scale_count"])
+        whole_count = int(base["whole_percentage_scale_count"])
+        outside_count = int(base["outside_percentage_range_count"])
+        has_both_groups = bool(
+            fractional_count >= self.config.percentage_min_group_count
+            and whole_count >= self.config.percentage_min_group_count
+        )
+        range_spans_unit = bool(
+            evidence_rate >= self.config.percentage_detection_min_numeric_rate
+            and has_both_groups
+        )
+        explicit_symbol_mix = bool(symbol_count > 0 and numeric_count > 0)
         mixed_scale = bool(
-            numeric_rate >= self.config.percentage_detection_min_numeric_rate
-            and has_fractional_form
-            and has_whole_form
+            explicit_symbol_mix
+            or (name_hint and has_both_groups and outside_count == 0)
         )
-        if mixed_scale and (name_hint or base["percentage_symbol_count"] > 0):
+        if explicit_symbol_mix:
             risk: Optional[str] = "high"
         elif mixed_scale:
-            risk = "possible"
+            risk = "high"
         else:
             risk = None
         return {
             "name_hint": name_hint,
             "potential_percentage": potential_percentage,
+            "evidence_rate": evidence_rate if non_missing else None,
+            "range_spans_unit": range_spans_unit,
+            "explicit_symbol_mix": explicit_symbol_mix,
             "mixed_scale": mixed_scale,
             "risk": risk,
         }
@@ -1007,16 +1279,34 @@ class DataFrameProfiler:
             flags.append("possible_key_verify_with_exact_distinct")
         if base["leading_zero_count"]:
             flags.append("leading_zero_numeric_strings")
+        if base["non_finite_count"]:
+            flags.append("non_finite_values_present")
+        if (
+            spec.inferred_type == "boolean"
+            and int(base["boolean_count"]) == non_missing
+            and int(base["integer_count"]) == non_missing
+            and non_missing > 0
+        ):
+            flags.append("boolean_integer_ambiguous")
+        if self._yyyymmdd_integer_ambiguity(base, non_missing):
+            flags.append("ambiguous_yyyymmdd_or_integer")
         if len(base["observed_decimal_scales"]) > 1:
             flags.append("mixed_decimal_scales")
         if percentage["potential_percentage"]:
             flags.append("potential_percentage_column")
+        if percentage["range_spans_unit"]:
+            flags.append("numeric_range_spans_unit")
         if percentage["mixed_scale"]:
             flags.append("possible_mixed_percentage_scales")
         if percentage["risk"] == "high":
             flags.append("high_risk_mixed_percentage_scales")
-        if base["percentage_symbol_count"] and base["double_count"]:
+        if percentage["explicit_symbol_mix"]:
             flags.append("mixed_percent_symbol_and_numeric_values")
+        if (
+            percentage["potential_percentage"]
+            and base["outside_percentage_range_count"]
+        ):
+            flags.append("percentage_values_outside_expected_range")
         if spec.semantic_type == "identifier" and spec.suggested_type == "string":
             flags.append("identifier_preserved_as_string")
         if len(spec.observed_formats) > 1:
@@ -1032,12 +1322,18 @@ class DataFrameProfiler:
     def _text_components(
         self, source_field: T.StructField
     ) -> Tuple[Column, Column, Column, Column, Column, Column]:
-        raw = F.col(source_field.name)
+        raw = _source_column(source_field.name)
         text = raw.cast("string")
+        if not isinstance(source_field.dataType, T.StringType):
+            false = F.lit(False)
+            return raw, text, text, raw.isNull(), false, false
+
         clean = F.trim(text) if self.config.trim_strings else text
         blank = raw.isNotNull() & (F.length(F.trim(text)) == 0)
 
-        null_values = tuple(value for value in self.config.null_like_values if value != "")
+        null_values = tuple(
+            value for value in self.config.null_like_values if value != ""
+        )
         if self.config.case_sensitive_nulls:
             null_probe = clean
             candidates = null_values
@@ -1060,8 +1356,10 @@ class DataFrameProfiler:
             return F.when(~missing, raw)
 
         valid_text = F.when(~missing, clean)
-        if target == "string" or target.startswith("integer (>") or target.startswith(
-            "decimal ("
+        if (
+            target == "string"
+            or target.startswith("integer (>")
+            or target.startswith("decimal (")
         ):
             return valid_text
         if target == "boolean":
@@ -1082,23 +1380,25 @@ class DataFrameProfiler:
                 [self._timestamp_parser(valid_text, fmt) for fmt in formats],
                 T.TimestampType(),
             )
+        if target in ("integer", "int", "bigint", "long"):
+            return F.when(valid_text.rlike(_INTEGER_RE), valid_text.cast(target))
+        decimal_target = re.fullmatch(r"decimal\(([0-9]+),([0-9]+)\)", target)
+        if decimal_target:
+            pattern = _INTEGER_RE if int(decimal_target.group(2)) == 0 else _DECIMAL_RE
+            return F.when(valid_text.rlike(pattern), valid_text.cast(target))
+        if target in ("double", "float"):
+            return F.when(valid_text.rlike(_DOUBLE_RE), valid_text.cast(target))
         return valid_text.cast(target)
 
     @staticmethod
     def _date_parser(value: Column, fmt: str) -> Column:
-        if hasattr(F, "try_to_timestamp"):
-            parsed = F.try_to_timestamp(value, F.lit(fmt)).cast("date")
-        else:  # Spark < 3.5
-            parsed = F.to_date(value, fmt)
+        parsed = F.try_to_timestamp(value, F.lit(fmt)).cast("date")
         regex = _FORMAT_REGEXES.get(fmt)
         return F.when(value.rlike(regex), parsed) if regex else parsed
 
     @staticmethod
     def _timestamp_parser(value: Column, fmt: str) -> Column:
-        if hasattr(F, "try_to_timestamp"):
-            parsed = F.try_to_timestamp(value, F.lit(fmt))
-        else:  # Spark < 3.5
-            parsed = F.to_timestamp(value, fmt)
+        parsed = F.try_to_timestamp(value, F.lit(fmt))
         regex = _FORMAT_REGEXES.get(fmt)
         return F.when(value.rlike(regex), parsed) if regex else parsed
 
@@ -1118,6 +1418,8 @@ class DataFrameProfiler:
             "date": T.DateType(),
             "timestamp": T.TimestampType(),
         }
+        if target == "timestamp_ntz" and hasattr(T, "TimestampNTZType"):
+            return T.TimestampNTZType()
         if target in simple:
             return simple[target]
         decimal_match = re.fullmatch(r"decimal\(([0-9]+),([0-9]+)\)", target)
@@ -1190,6 +1492,10 @@ def _profile_schema() -> T.StructType:
         ("avg_length", T.DoubleType(), True),
         ("padded_count", T.LongType(), False),
         ("leading_zero_count", T.LongType(), False),
+        ("nan_count", T.LongType(), False),
+        ("positive_infinity_count", T.LongType(), False),
+        ("negative_infinity_count", T.LongType(), False),
+        ("non_finite_count", T.LongType(), False),
         ("observed_decimal_scales", T.ArrayType(T.IntegerType(), False), False),
         ("min_observed_decimal_scale", T.IntegerType(), True),
         ("max_observed_decimal_scale", T.IntegerType(), True),
@@ -1213,17 +1519,22 @@ def _profile_schema() -> T.StructType:
         ("timestamp_parse_rate", T.DoubleType(), True),
         ("percentage_name_hint", T.BooleanType(), False),
         ("potential_percentage_type", T.BooleanType(), False),
+        ("percentage_evidence_rate", T.DoubleType(), True),
         ("percentage_symbol_count", T.LongType(), False),
         ("fractional_percentage_scale_count", T.LongType(), False),
         ("whole_percentage_scale_count", T.LongType(), False),
         ("outside_percentage_range_count", T.LongType(), False),
+        ("numeric_range_spans_unit", T.BooleanType(), False),
         ("mixed_percentage_scale_candidate", T.BooleanType(), False),
         ("percentage_scale_risk", T.StringType(), True),
         ("quality_flags", T.ArrayType(T.StringType(), False), False),
         ("notes", T.ArrayType(T.StringType(), False), False),
     ]
     return T.StructType(
-        [T.StructField(name, data_type, nullable) for name, data_type, nullable in fields]
+        [
+            T.StructField(name, data_type, nullable)
+            for name, data_type, nullable in fields
+        ]
     )
 
 
@@ -1231,10 +1542,22 @@ def _count_when(predicate: Column) -> Column:
     return F.sum(F.when(predicate, F.lit(1)).otherwise(F.lit(0))).cast("long")
 
 
+def _aggregate_literal(value: Any, data_type: Any) -> Column:
+    return F.first(F.lit(value).cast(data_type), ignorenulls=False)
+
+
 def _coalesce_or_null(expressions: Sequence[Column], data_type: T.DataType) -> Column:
     if expressions:
         return F.coalesce(*expressions)
     return F.lit(None).cast(data_type)
+
+
+def _quote_identifier(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _source_column(name: str) -> Column:
+    return F.col(_quote_identifier(name))
 
 
 def _ratio(numerator: int, denominator: int) -> Optional[float]:
@@ -1275,6 +1598,17 @@ def _stringify(value: Any) -> Optional[str]:
             return str(value)
         return format(value, ".15g")
     return str(value)
+
+
+def _format_timestamp_micros(value: Any, target: str) -> Optional[str]:
+    if value is None:
+        return None
+    microseconds = int(value)
+    if target == "timestamp_ntz":
+        epoch = dt.datetime(1970, 1, 1)
+        return (epoch + dt.timedelta(microseconds=microseconds)).isoformat()
+    timestamp = dt.datetime.fromtimestamp(microseconds / 1_000_000, tz=dt.timezone.utc)
+    return timestamp.isoformat().replace("+00:00", "Z")
 
 
 def _boolean_string(value: Any) -> Optional[str]:

@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pyspark: ["3.5.3", "4.0.0"]
+        ansi: ["true", "false"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install test dependencies
+        run: python -m pip install pytest "pyspark==${{ matrix.pyspark }}"
+      - name: Run tests
+        env:
+          SPARK_LOCAL_IP: 127.0.0.1
+          SPARK_ANSI_ENABLED: ${{ matrix.ansi }}
+        run: python -m pytest -q
